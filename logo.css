@@ -1,0 +1,49 @@
+/* logo.css */
+.logo-container {
+    display: flex;
+    align-items: center;
+    margin-right: 30px;
+    float: left;
+    transition: transform 0.3s ease;
+}
+
+.logo-container:hover {
+    transform: scale(1.05);
+}
+
+.logo-text {
+    color: white;
+    font-size: 1.8em;
+    font-weight: bold;
+    text-decoration: none;
+    margin-left: 12px;
+    font-family: 'Georgia', serif;
+    transition: color 0.3s ease;
+}
+
+.logo-text:hover {
+    color: #f8f9fa;
+}
+
+.logo-img {
+    width: 40px;
+    height: 40px;
+    object-fit: contain;
+    border-radius: 8px;
+    transition: all 0.3s ease;
+}
+
+/* 如果图片加载失败，显示备用样式 */
+.logo-img:after {
+    content: "M";
+    display: none;
+    background: #007bff;
+    color: white;
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+}
