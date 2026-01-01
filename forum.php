@@ -1,13 +1,94 @@
 <?php
-// forum.php - TechStore Community Forum
+// forum.php - TechStore Community Forum (修复版)
 session_start();
 require_once 'config.php';
 
 // 获取数据库连接
-$pdo = getDatabaseConnection(); // 添加这一行
+$pdo = getDatabaseConnection();
 if (!$pdo) {
-    die("Database connection failed");
+    die("<div class='error'>Database connection failed. Please check your config.php file.</div>");
 }
+
+// 检查并创建论坛表（如果不存在）
+function createForumTablesIfNeeded($pdo) {
+    $tables = [
+        'forum_posts' => "CREATE TABLE IF NOT EXISTS forum_posts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            title VARCHAR(255) NOT NULL,
+            content TEXT NOT NULL,
+            user_id INT NOT NULL,
+            author_name VARCHAR(100) NOT NULL,
+            views INT DEFAULT 0,
+            likes INT DEFAULT 0,
+            replies_count INT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_user_id (user_id),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        
+        'forum_replies' => "CREATE TABLE IF NOT EXISTS forum_replies (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            post_id INT NOT NULL,
+            user_id INT NOT NULL,
+            author_name VARCHAR(100) NOT NULL,
+            content TEXT NOT NULL,
+            likes INT DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_post_id (post_id),
+            INDEX idx_user_id (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        
+        'forum_tags' => "CREATE TABLE IF NOT EXISTS forum_tags (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(50) NOT NULL UNIQUE,
+            description VARCHAR(200),
+            usage_count INT DEFAULT 0
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        
+        'post_tags' => "CREATE TABLE IF NOT EXISTS post_tags (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            post_id INT NOT NULL,
+            tag_id INT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_post_tag (post_id, tag_id),
+            INDEX idx_post_id (post_id),
+            INDEX idx_tag_id (tag_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    ];
+    
+    foreach ($tables as $table => $sql) {
+        try {
+            $pdo->exec($sql);
+            
+            // 如果是标签表，插入默认标签
+            if ($table === 'forum_tags') {
+                $defaultTags = [
+                    ['Hardware', 'Tech Hardware Discussions'],
+                    ['Software', 'Software & Apps'],
+                    ['Reviews', 'Product Reviews'],
+                    ['Troubleshooting', 'Technical Support'],
+                    ['Deals', 'Deals & Discounts'],
+                    ['News', 'Tech News'],
+                    ['Gaming', 'Gaming Hardware & Software'],
+                    ['Programming', 'Coding & Development'],
+                    ['Security', 'Cybersecurity & Privacy'],
+                    ['Mobile', 'Mobile Devices & Apps']
+                ];
+                
+                foreach ($defaultTags as $tag) {
+                    $stmt = $pdo->prepare("INSERT IGNORE INTO forum_tags (name, description) VALUES (?, ?)");
+                    $stmt->execute([$tag[0], $tag[1]]);
+                }
+            }
+        } catch (PDOException $e) {
+            error_log("Table creation error for $table: " . $e->getMessage());
+        }
+    }
+}
+
+// 创建表（如果不存在）
+createForumTablesIfNeeded($pdo);
 
 // 获取论坛统计数据
 function getForumStats($pdo) {
@@ -23,23 +104,32 @@ function getForumStats($pdo) {
         $today = date('Y-m-d');
         $stmt = $pdo->prepare("SELECT COUNT(*) FROM forum_posts WHERE DATE(created_at) = ?");
         $stmt->execute([$today]);
-        $stats['today_posts'] = $stmt->fetchColumn();
+        $stats['today_posts'] = $stmt->fetchColumn() ?: 0;
         
         // 获取总回复数
         $stmt = $pdo->prepare("SELECT COUNT(*) FROM forum_replies");
         $stmt->execute();
-        $stats['total_replies'] = $stmt->fetchColumn();
+        $stats['total_replies'] = $stmt->fetchColumn() ?: 0;
         
         // 获取活跃主题数（最近7天有活动的主题）
         $weekAgo = date('Y-m-d', strtotime('-7 days'));
-        $stmt = $pdo->prepare("SELECT COUNT(DISTINCT topic_id) FROM forum_activity WHERE activity_date >= ?");
-        $stmt->execute([$weekAgo]);
-        $stats['active_topics'] = $stmt->fetchColumn();
+        $stmt = $pdo->prepare("
+            SELECT COUNT(DISTINCT id) 
+            FROM forum_posts 
+            WHERE created_at >= ? 
+            OR id IN (
+                SELECT DISTINCT post_id 
+                FROM forum_replies 
+                WHERE created_at >= ?
+            )
+        ");
+        $stmt->execute([$weekAgo, $weekAgo]);
+        $stats['active_topics'] = $stmt->fetchColumn() ?: 0;
         
         // 获取总会员数
         $stmt = $pdo->prepare("SELECT COUNT(*) FROM users");
         $stmt->execute();
-        $stats['total_members'] = $stmt->fetchColumn();
+        $stats['total_members'] = $stmt->fetchColumn() ?: 0;
         
     } catch (PDOException $e) {
         error_log("Forum stats error: " . $e->getMessage());
@@ -50,104 +140,231 @@ function getForumStats($pdo) {
 
 // 获取热门标签
 function getPopularTags($pdo) {
-    $tags = [
-        ['name' => 'Hardware', 'description' => 'Tech Hardware Discussions', 'count' => 24],
-        ['name' => 'Software', 'description' => 'Software & Apps', 'count' => 18],
-        ['name' => 'Reviews', 'description' => 'Product Reviews', 'count' => 15],
-        ['name' => 'Troubleshooting', 'description' => 'Technical Support', 'count' => 12],
-        ['name' => 'Deals', 'description' => 'Deals & Discounts', 'count' => 9],
-        ['name' => 'News', 'description' => 'Tech News', 'count' => 7]
-    ];
+    $tags = [];
+    try {
+        $stmt = $pdo->query("
+            SELECT t.name, t.description, COUNT(pt.tag_id) as count 
+            FROM forum_tags t 
+            LEFT JOIN post_tags pt ON t.id = pt.tag_id 
+            GROUP BY t.id 
+            ORDER BY count DESC, t.name ASC 
+            LIMIT 12
+        ");
+        $tags = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        // 如果没有标签，返回默认值
+        if (empty($tags)) {
+            $defaultTags = [
+                ['name' => 'Hardware', 'description' => 'Tech Hardware Discussions', 'count' => 24],
+                ['name' => 'Software', 'description' => 'Software & Apps', 'count' => 18],
+                ['name' => 'Reviews', 'description' => 'Product Reviews', 'count' => 15],
+                ['name' => 'Troubleshooting', 'description' => 'Technical Support', 'count' => 12],
+                ['name' => 'Deals', 'description' => 'Deals & Discounts', 'count' => 9],
+                ['name' => 'News', 'description' => 'Tech News', 'count' => 7]
+            ];
+            return $defaultTags;
+        }
+    } catch (PDOException $e) {
+        error_log("Popular tags error: " . $e->getMessage());
+    }
     
     return $tags;
 }
 
 // 获取最新讨论
 function getLatestDiscussions($pdo) {
-    $discussions = [
-        [
-            'id' => 1,
-            'title' => 'Best Laptop for Programming in 2024?',
-            'author' => 'AlexChen',
-            'author_avatar' => 'AC',
-            'replies' => 15,
-            'likes' => 42,
-            'views' => 320,
-            'last_activity' => '2 hours ago',
-            'tags' => ['Hardware', 'Software']
-        ],
-        [
-            'id' => 2,
-            'title' => 'iPhone 15 Pro vs Samsung S24 Ultra - Which to choose?',
-            'author' => 'SarahTech',
-            'author_avatar' => 'ST',
-            'replies' => 28,
-            'likes' => 67,
-            'views' => 540,
-            'last_activity' => '5 hours ago',
-            'tags' => ['Reviews', 'Hardware']
-        ],
-        [
-            'id' => 3,
-            'title' => 'Windows 11 Update Causing Bluetooth Issues',
-            'author' => 'MikeHelper',
-            'author_avatar' => 'MH',
-            'replies' => 9,
-            'likes' => 23,
-            'views' => 180,
-            'last_activity' => '1 day ago',
-            'tags' => ['Troubleshooting', 'Software']
-        ],
-        [
-            'id' => 4,
-            'title' => 'Black Friday Tech Deals Tracking Thread',
-            'author' => 'DealFinder',
-            'author_avatar' => 'DF',
-            'replies' => 45,
-            'likes' => 89,
-            'views' => 920,
-            'last_activity' => '2 days ago',
-            'tags' => ['Deals', 'News']
-        ],
-        [
-            'id' => 5,
-            'title' => 'Building a Gaming PC - Parts Compatibility Check',
-            'author' => 'GamerPro',
-            'author_avatar' => 'GP',
-            'replies' => 32,
-            'likes' => 56,
-            'views' => 680,
-            'last_activity' => '3 days ago',
-            'tags' => ['Hardware', 'Troubleshooting']
-        ]
-    ];
+    $discussions = [];
+    try {
+        $stmt = $pdo->query("
+            SELECT p.*, u.username as author_username
+            FROM forum_posts p
+            LEFT JOIN users u ON p.user_id = u.id
+            ORDER BY p.created_at DESC
+            LIMIT 10
+        ");
+        
+        $posts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        foreach ($posts as $post) {
+            // 获取帖子的标签
+            $tagStmt = $pdo->prepare("
+                SELECT t.name 
+                FROM forum_tags t
+                JOIN post_tags pt ON t.id = pt.tag_id
+                WHERE pt.post_id = ?
+            ");
+            $tagStmt->execute([$post['id']]);
+            $tags = $tagStmt->fetchAll(PDO::FETCH_COLUMN);
+            
+            // 计算最后活动时间
+            $lastActivity = strtotime($post['updated_at']);
+            $now = time();
+            $diff = $now - $lastActivity;
+            
+            if ($diff < 3600) {
+                $lastActivityText = floor($diff / 60) . ' minutes ago';
+            } elseif ($diff < 86400) {
+                $lastActivityText = floor($diff / 3600) . ' hours ago';
+            } else {
+                $lastActivityText = floor($diff / 86400) . ' days ago';
+            }
+            
+            // 获取作者头像首字母
+            $authorName = $post['author_name'] ?? $post['author_username'] ?? 'Anonymous';
+            $authorAvatar = strtoupper(substr($authorName, 0, 2));
+            
+            $discussions[] = [
+                'id' => $post['id'],
+                'title' => htmlspecialchars($post['title']),
+                'author' => $authorName,
+                'author_avatar' => $authorAvatar,
+                'replies' => $post['replies_count'] ?? 0,
+                'likes' => $post['likes'] ?? 0,
+                'views' => $post['views'] ?? 0,
+                'last_activity' => $lastActivityText,
+                'tags' => $tags ?: ['General']
+            ];
+        }
+        
+        // 如果没有帖子，返回示例数据
+        if (empty($discussions)) {
+            return [
+                [
+                    'id' => 1,
+                    'title' => 'Welcome to TechStore Forum!',
+                    'author' => 'Admin',
+                    'author_avatar' => 'AD',
+                    'replies' => 0,
+                    'likes' => 0,
+                    'views' => 0,
+                    'last_activity' => 'Just now',
+                    'tags' => ['Welcome']
+                ]
+            ];
+        }
+        
+    } catch (PDOException $e) {
+        error_log("Latest discussions error: " . $e->getMessage());
+        
+        // 发生错误时返回示例数据
+        return [
+            [
+                'id' => 1,
+                'title' => 'Best Laptop for Programming in 2024?',
+                'author' => 'AlexChen',
+                'author_avatar' => 'AC',
+                'replies' => 15,
+                'likes' => 42,
+                'views' => 320,
+                'last_activity' => '2 hours ago',
+                'tags' => ['Hardware', 'Software']
+            ]
+        ];
+    }
     
     return $discussions;
 }
 
-// 获取统计数据
-$forumStats = getForumStats($pdo);
-$popularTags = getPopularTags($pdo);
-$latestDiscussions = getLatestDiscussions($pdo);
-
 // 处理新帖子提交
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     if ($_POST['action'] === 'create_post') {
-        $title = sanitize_input($_POST['title'] ?? '');
-        $content = sanitize_input($_POST['content'] ?? '');
+        $title = trim($_POST['title'] ?? '');
+        $content = trim($_POST['content'] ?? '');
         $tags = $_POST['tags'] ?? [];
         
         if (!empty($title) && !empty($content)) {
-            // 这里添加保存到数据库的逻辑
-            $_SESSION['forum_message'] = 'New discussion created successfully!';
-            header('Location: forum.php');
-            exit;
+            try {
+                // 获取当前用户信息
+                $user_id = $_SESSION['user_id'] ?? 0;
+                $author_name = $_SESSION['username'] ?? 'Anonymous';
+                
+                if ($user_id === 0) {
+                    // 如果没有登录，显示错误信息
+                    $_SESSION['forum_error'] = 'Please login to create a discussion.';
+                    header('Location: login.php');
+                    exit;
+                }
+                
+                // 保存帖子到数据库
+                $stmt = $pdo->prepare("
+                    INSERT INTO forum_posts (title, content, user_id, author_name, created_at) 
+                    VALUES (?, ?, ?, ?, NOW())
+                ");
+                
+                $stmt->execute([
+                    htmlspecialchars($title), 
+                    htmlspecialchars($content), 
+                    $user_id, 
+                    $author_name
+                ]);
+                
+                $post_id = $pdo->lastInsertId();
+                
+                // 保存标签
+                if (!empty($tags) && is_array($tags)) {
+                    foreach ($tags as $tagName) {
+                        $tagName = trim(htmlspecialchars($tagName));
+                        if (!empty($tagName)) {
+                            // 获取或创建标签
+                            $tagStmt = $pdo->prepare("
+                                INSERT IGNORE INTO forum_tags (name) VALUES (?)
+                            ");
+                            $tagStmt->execute([$tagName]);
+                            
+                            // 获取标签ID
+                            $tagIdStmt = $pdo->prepare("SELECT id FROM forum_tags WHERE name = ?");
+                            $tagIdStmt->execute([$tagName]);
+                            $tag_id = $tagIdStmt->fetchColumn();
+                            
+                            if ($tag_id) {
+                                // 关联帖子与标签
+                                $linkStmt = $pdo->prepare("
+                                    INSERT IGNORE INTO post_tags (post_id, tag_id) VALUES (?, ?)
+                                ");
+                                $linkStmt->execute([$post_id, $tag_id]);
+                            }
+                        }
+                    }
+                }
+                
+                $_SESSION['forum_message'] = 'New discussion created successfully!';
+                $_SESSION['new_post_id'] = $post_id;
+                
+                // 重定向到新帖子页面
+                header('Location: forum.php');
+                exit;
+                
+            } catch (PDOException $e) {
+                error_log("Create post error: " . $e->getMessage());
+                $_SESSION['forum_error'] = 'Failed to create discussion. Please try again.';
+            }
+        } else {
+            $_SESSION['forum_error'] = 'Title and content are required.';
         }
     }
 }
 
+// 检查是否有成功/错误消息
+$forum_message = $_SESSION['forum_message'] ?? '';
+$forum_error = $_SESSION['forum_error'] ?? '';
+unset($_SESSION['forum_message'], $_SESSION['forum_error']);
+
+// 获取数据
+$forumStats = getForumStats($pdo);
+$popularTags = getPopularTags($pdo);
+$latestDiscussions = getLatestDiscussions($pdo);
+
+// 获取所有标签用于选择
+$allTags = [];
+try {
+    $stmt = $pdo->query("SELECT name FROM forum_tags ORDER BY name");
+    $allTags = $stmt->fetchAll(PDO::FETCH_COLUMN);
+} catch (PDOException $e) {
+    error_log("Get all tags error: " . $e->getMessage());
+}
+
 function sanitize_input($data) {
-    return htmlspecialchars(strip_tags(trim($data)));
+    return htmlspecialchars(strip_tags(trim($data)), ENT_QUOTES, 'UTF-8');
 }
 ?>
 <!DOCTYPE html>
@@ -186,6 +403,47 @@ function sanitize_input($data) {
             line-height: 1.7;
             margin: 0;
             padding: 0;
+            position: relative;
+            min-height: 100vh;
+            padding-bottom: 120px; /* 为页脚留出空间 */
+        }
+
+        /* 消息样式 */
+        .forum-message {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+            color: white;
+            padding: 1rem 1.5rem;
+            border-radius: var(--radius);
+            margin: 1rem auto;
+            max-width: 1200px;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            animation: slideDown 0.3s ease;
+        }
+
+        .forum-error {
+            background: linear-gradient(135deg, var(--danger) 0%, #c82333 100%);
+            color: white;
+            padding: 1rem 1.5rem;
+            border-radius: var(--radius);
+            margin: 1rem auto;
+            max-width: 1200px;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            animation: slideDown 0.3s ease;
+        }
+
+        @keyframes slideDown {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
         }
 
         .forum-container {
@@ -479,6 +737,9 @@ function sanitize_input($data) {
             min-width: 120px;
             text-align: center;
             transition: var(--transition);
+            cursor: pointer;
+            border: none;
+            font-family: inherit;
         }
 
         .tag-large:hover {
@@ -493,57 +754,19 @@ function sanitize_input($data) {
             margin-top: 0.25rem;
         }
 
-        /* Trending Widget */
-        .trending-list {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .trending-item {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            padding: 1rem;
-            background: var(--bg);
-            border-radius: var(--radius);
-            transition: var(--transition);
-        }
-
-        .trending-item:hover {
-            background: white;
-            box-shadow: var(--shadow-light);
-        }
-
-        .trending-rank {
-            font-family: 'Poppins', sans-serif;
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--primary);
-            min-width: 40px;
-        }
-
-        .trending-content h4 {
-            margin: 0 0 0.25rem 0;
-            font-size: 0.95rem;
-        }
-
-        .trending-content p {
-            margin: 0;
-            font-size: 0.85rem;
-            color: var(--text-light);
-        }
-
         /* Quick Post Form */
         .quick-post-form {
             background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
             border-radius: var(--radius);
-            padding: 1.5rem;
+            padding: 2rem;
             margin-top: 2rem;
+            margin-bottom: 3rem; /* 为页脚留出更多空间 */
+            position: relative;
+            z-index: 10;
         }
 
         .form-group {
-            margin-bottom: 1rem;
+            margin-bottom: 1.5rem;
         }
 
         .form-control {
@@ -564,8 +787,40 @@ function sanitize_input($data) {
         }
 
         textarea.form-control {
-            min-height: 120px;
+            min-height: 150px;
             resize: vertical;
+        }
+
+        .tag-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .tag-option {
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 20px;
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .tag-option:hover {
+            border-color: var(--primary);
+            background: rgba(0, 123, 255, 0.1);
+        }
+
+        .tag-option.selected {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .tag-option input {
+            display: none;
         }
 
         .btn-submit {
@@ -579,6 +834,7 @@ function sanitize_input($data) {
             font-weight: 600;
             cursor: pointer;
             transition: var(--transition);
+            font-size: 1rem;
         }
 
         .btn-submit:hover {
@@ -586,7 +842,21 @@ function sanitize_input($data) {
             box-shadow: 0 5px 15px rgba(40, 167, 69, 0.3);
         }
 
-        /* Responsive Design */
+        /* 页脚修复 */
+        footer.glass-footer {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(8px);
+            color: rgba(255, 255, 255, 0.8);
+            padding: 1.2rem;
+            text-align: center;
+            z-index: 1000;
+        }
+
+        /* 响应式设计 */
         @media (max-width: 992px) {
             .forum-container {
                 grid-template-columns: 1fr;
@@ -630,11 +900,30 @@ function sanitize_input($data) {
             .forum-section, .sidebar-widget {
                 padding: 1.25rem;
             }
+            
+            body {
+                padding-bottom: 100px;
+            }
         }
     </style>
 </head>
 <body>
     <?php include 'navbar.php'; ?>
+
+    <!-- 显示消息 -->
+    <?php if ($forum_message): ?>
+    <div class="forum-message">
+        <i class="fas fa-check-circle"></i>
+        <?php echo htmlspecialchars($forum_message); ?>
+    </div>
+    <?php endif; ?>
+    
+    <?php if ($forum_error): ?>
+    <div class="forum-error">
+        <i class="fas fa-exclamation-triangle"></i>
+        <?php echo htmlspecialchars($forum_error); ?>
+    </div>
+    <?php endif; ?>
 
     <div class="forum-container">
         <!-- Hero Section -->
@@ -675,23 +964,23 @@ function sanitize_input($data) {
                 
                 <div class="discussion-list">
                     <?php foreach ($latestDiscussions as $discussion): ?>
-                    <div class="discussion-card">
+                    <div class="discussion-card" data-id="<?php echo $discussion['id']; ?>">
                         <div class="author-avatar"><?php echo $discussion['author_avatar']; ?></div>
                         
                         <div class="discussion-content">
                             <h3 class="discussion-title">
-                                <a href="forum-topic.php?id=<?php echo $discussion['id']; ?>"><?php echo htmlspecialchars($discussion['title']); ?></a>
+                                <a href="forum-topic.php?id=<?php echo $discussion['id']; ?>"><?php echo $discussion['title']; ?></a>
                             </h3>
                             
                             <div class="discussion-meta">
-                                <span class="discussion-author"><?php echo htmlspecialchars($discussion['author']); ?></span>
+                                <span class="discussion-author"><?php echo $discussion['author']; ?></span>
                                 <span>•</span>
                                 <span>Last activity: <?php echo $discussion['last_activity']; ?></span>
                             </div>
                             
                             <div class="discussion-tags">
                                 <?php foreach ($discussion['tags'] as $tag): ?>
-                                <span class="tag">#<?php echo $tag; ?></span>
+                                <span class="tag">#<?php echo htmlspecialchars($tag); ?></span>
                                 <?php endforeach; ?>
                             </div>
                         </div>
@@ -719,6 +1008,7 @@ function sanitize_input($data) {
             <section class="forum-section quick-post-form" id="new-post-form">
                 <h2 style="margin: 0 0 1.5rem 0; font-family: 'Poppins', sans-serif;">Start a New Discussion</h2>
                 
+                <?php if (isset($_SESSION['user_id'])): ?>
                 <form method="post" action="">
                     <input type="hidden" name="action" value="create_post">
                     
@@ -731,21 +1021,36 @@ function sanitize_input($data) {
                     </div>
                     
                     <div class="form-group">
-                        <select name="tags[]" class="form-control" multiple style="height: auto; min-height: 80px;">
-                            <option value="Hardware">Hardware</option>
-                            <option value="Software">Software</option>
-                            <option value="Reviews">Reviews</option>
-                            <option value="Troubleshooting">Troubleshooting</option>
-                            <option value="Deals">Deals</option>
-                            <option value="News">News</option>
-                        </select>
-                        <small style="display: block; margin-top: 0.5rem; color: var(--text-light);">Hold Ctrl/Cmd to select multiple tags</small>
+                        <label style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Select Tags:</label>
+                        <div class="tag-selector" id="tagSelector">
+                            <?php foreach ($allTags as $tag): ?>
+                            <label class="tag-option">
+                                <input type="checkbox" name="tags[]" value="<?php echo htmlspecialchars($tag); ?>">
+                                <?php echo htmlspecialchars($tag); ?>
+                            </label>
+                            <?php endforeach; ?>
+                        </div>
+                        <small style="display: block; margin-top: 0.5rem; color: var(--text-light);">You can also type new tags in the text box below</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <input type="text" name="new_tags" class="form-control" placeholder="Add custom tags (separate with commas)">
                     </div>
                     
                     <button type="submit" class="btn-submit">
                         <i class="fas fa-paper-plane"></i> Publish Discussion
                     </button>
                 </form>
+                <?php else: ?>
+                <div style="text-align: center; padding: 3rem 1rem;">
+                    <i class="fas fa-user-lock" style="font-size: 3rem; color: var(--text-light); margin-bottom: 1.5rem;"></i>
+                    <h3 style="margin: 0 0 1rem 0; color: var(--text);">Login Required</h3>
+                    <p style="color: var(--text-light); margin-bottom: 2rem;">Please login to start a new discussion.</p>
+                    <a href="login.php" class="btn-primary" style="text-decoration: none;">
+                        <i class="fas fa-sign-in-alt"></i> Login to Continue
+                    </a>
+                </div>
+                <?php endif; ?>
             </section>
         </main>
 
@@ -756,52 +1061,48 @@ function sanitize_input($data) {
                 <h3 class="widget-title">Popular Tags</h3>
                 <div class="tags-grid">
                     <?php foreach ($popularTags as $tag): ?>
-                    <div class="tag-large">
-                        #<?php echo $tag['name']; ?>
-                        <span class="tag-description"><?php echo $tag['description']; ?></span>
-                    </div>
+                    <button type="button" class="tag-large" onclick="addTagToForm('<?php echo htmlspecialchars($tag['name']); ?>')">
+                        #<?php echo htmlspecialchars($tag['name']); ?>
+                        <span class="tag-description"><?php echo htmlspecialchars($tag['description'] ?? ''); ?></span>
+                        <?php if (isset($tag['count'])): ?>
+                        <span class="tag-description"><?php echo $tag['count']; ?> posts</span>
+                        <?php endif; ?>
+                    </button>
                     <?php endforeach; ?>
-                </div>
-            </div>
-
-            <!-- Trending Now -->
-            <div class="sidebar-widget">
-                <h3 class="widget-title">Trending Now</h3>
-                <div class="trending-list">
-                    <div class="trending-item">
-                        <div class="trending-rank">1</div>
-                        <div class="trending-content">
-                            <h4>Best Wireless Earbuds 2024</h4>
-                            <p>235 replies • 1.2k views</p>
-                        </div>
-                    </div>
-                    <div class="trending-item">
-                        <div class="trending-rank">2</div>
-                        <div class="trending-content">
-                            <h4>Windows 11 Performance Tips</h4>
-                            <p>189 replies • 980 views</p>
-                        </div>
-                    </div>
-                    <div class="trending-item">
-                        <div class="trending-rank">3</div>
-                        <div class="trending-content">
-                            <h4>MacBook Air M3 Review</h4>
-                            <p>156 replies • 850 views</p>
-                        </div>
-                    </div>
                 </div>
             </div>
 
             <!-- Community Guidelines -->
             <div class="sidebar-widget">
                 <h3 class="widget-title">Community Guidelines</h3>
-                <ul style="margin: 0; padding-left: 1.2rem; color: var(--text-light); font-size: 0.9rem;">
+                <ul style="margin: 0; padding-left: 1.2rem; color: var(--text-light); font-size: 0.9rem; line-height: 1.8;">
                     <li>Be respectful to all members</li>
                     <li>Stay on topic in discussions</li>
                     <li>No spam or self-promotion</li>
                     <li>Share knowledge and help others</li>
                     <li>Report inappropriate content</li>
                 </ul>
+            </div>
+
+            <!-- Quick Links -->
+            <div class="sidebar-widget">
+                <h3 class="widget-title">Quick Links</h3>
+                <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                    <a href="index.php" style="display: flex; align-items: center; gap: 0.75rem; color: var(--primary); text-decoration: none; padding: 0.75rem; background: var(--bg); border-radius: var(--radius); transition: var(--transition);">
+                        <i class="fas fa-home"></i>
+                        <span>Back to Home</span>
+                    </a>
+                    <?php if (isset($_SESSION['user_id'])): ?>
+                    <a href="profile.php" style="display: flex; align-items: center; gap: 0.75rem; color: var(--primary); text-decoration: none; padding: 0.75rem; background: var(--bg); border-radius: var(--radius); transition: var(--transition);">
+                        <i class="fas fa-user"></i>
+                        <span>My Profile</span>
+                    </a>
+                    <?php endif; ?>
+                    <a href="products.php" style="display: flex; align-items: center; gap: 0.75rem; color: var(--primary); text-decoration: none; padding: 0.75rem; background: var(--bg); border-radius: var(--radius); transition: var(--transition);">
+                        <i class="fas fa-shopping-cart"></i>
+                        <span>Browse Products</span>
+                    </a>
+                </div>
             </div>
         </aside>
     </div>
@@ -810,21 +1111,18 @@ function sanitize_input($data) {
 
     <script>
         document.addEventListener('DOMContentLoaded', function() {
-            // Smooth scroll for new post button
-            document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-                anchor.addEventListener('click', function(e) {
+            // 标签选择器
+            const tagOptions = document.querySelectorAll('.tag-option');
+            tagOptions.forEach(option => {
+                option.addEventListener('click', function(e) {
                     e.preventDefault();
-                    const target = document.querySelector(this.getAttribute('href'));
-                    if (target) {
-                        target.scrollIntoView({
-                            behavior: 'smooth',
-                            block: 'start'
-                        });
-                    }
+                    const checkbox = this.querySelector('input[type="checkbox"]');
+                    checkbox.checked = !checkbox.checked;
+                    this.classList.toggle('selected', checkbox.checked);
                 });
             });
 
-            // Form validation
+            // 表单提交验证
             const form = document.querySelector('form');
             if (form) {
                 form.addEventListener('submit', function(e) {
@@ -844,31 +1142,126 @@ function sanitize_input($data) {
                         content.focus();
                         return;
                     }
+                    
+                    // 处理自定义标签
+                    const newTagsInput = this.querySelector('input[name="new_tags"]');
+                    if (newTagsInput && newTagsInput.value.trim()) {
+                        const newTags = newTagsInput.value.split(',').map(tag => tag.trim()).filter(tag => tag);
+                        newTags.forEach(tag => {
+                            const hiddenInput = document.createElement('input');
+                            hiddenInput.type = 'hidden';
+                            hiddenInput.name = 'tags[]';
+                            hiddenInput.value = tag;
+                            this.appendChild(hiddenInput);
+                        });
+                    }
+                    
+                    // 显示加载状态
+                    const submitBtn = this.querySelector('button[type="submit"]');
+                    submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Publishing...';
+                    submitBtn.disabled = true;
                 });
             }
 
-            // Like functionality
+            // 点赞功能
             document.querySelectorAll('.stat-likes').forEach(likeBtn => {
                 likeBtn.style.cursor = 'pointer';
                 likeBtn.addEventListener('click', function(e) {
                     e.stopPropagation();
                     const countElement = this.querySelector('span');
-                    let count = parseInt(countElement.textContent);
+                    let count = parseInt(countElement.textContent) || 0;
                     countElement.textContent = (count + 1) + ' likes';
                     this.style.color = 'var(--accent)';
                     
-                    // Send AJAX request to server
-                    fetch('forum-like.php', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            action: 'like',
-                            discussion_id: this.closest('.discussion-card').dataset.id
-                        })
-                    });
+                    // 可以发送AJAX请求到服务器保存点赞
+                    const discussionCard = this.closest('.discussion-card');
+                    const postId = discussionCard ? discussionCard.dataset.id : null;
+                    
+                    if (postId) {
+                        fetch('forum-like.php', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                action: 'like',
+                                post_id: postId
+                            })
+                        }).catch(err => console.error('Like error:', err));
+                    }
                 });
+            });
+
+            // 自动滚动到新帖子（如果有的话）
+            <?php if (isset($_SESSION['new_post_id'])): ?>
+                const newPostId = <?php echo $_SESSION['new_post_id']; ?>;
+                const newPostElement = document.querySelector(`.discussion-card[data-id="${newPostId}"]`);
+                if (newPostElement) {
+                    newPostElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    newPostElement.style.animation = 'pulse 2s infinite';
+                    
+                    // 添加脉冲动画
+                    const style = document.createElement('style');
+                    style.textContent = `
+                        @keyframes pulse {
+                            0% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0.4); }
+                            70% { box-shadow: 0 0 0 10px rgba(0, 123, 255, 0); }
+                            100% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0); }
+                        }
+                    `;
+                    document.head.appendChild(style);
+                }
+            <?php unset($_SESSION['new_post_id']); endif; ?>
+        });
+
+        // 将标签添加到表单的函数
+        function addTagToForm(tagName) {
+            const tagSelector = document.getElementById('tagSelector');
+            const tagOptions = tagSelector.querySelectorAll('.tag-option');
+            
+            // 查找是否已有该标签
+            let found = false;
+            tagOptions.forEach(option => {
+                const checkbox = option.querySelector('input[type="checkbox"]');
+                if (checkbox.value === tagName) {
+                    checkbox.checked = !checkbox.checked;
+                    option.classList.toggle('selected', checkbox.checked);
+                    found = true;
+                }
+            });
+            
+            // 如果没有找到，添加到自定义标签输入框
+            if (!found) {
+                const newTagsInput = document.querySelector('input[name="new_tags"]');
+                if (newTagsInput) {
+                    const currentTags = newTagsInput.value.split(',').map(tag => tag.trim()).filter(tag => tag);
+                    if (!currentTags.includes(tagName)) {
+                        currentTags.push(tagName);
+                        newTagsInput.value = currentTags.join(', ');
+                        
+                        // 显示成功消息
+                        const message = document.createElement('div');
+                        message.textContent = `Tag "${tagName}" added to custom tags`;
+                        message.style.cssText = 'background: var(--accent); color: white; padding: 0.5rem 1rem; border-radius: var(--radius); margin-top: 0.5rem; font-size: 0.9rem;';
+                        newTagsInput.parentNode.insertBefore(message, newTagsInput.nextSibling);
+                        
+                        setTimeout(() => message.remove(), 3000);
+                    }
+                }
+            }
+        }
+
+        // 平滑滚动
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
             });
         });
     </script>
